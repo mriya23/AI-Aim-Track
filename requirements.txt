@@ -1,7 +1,7 @@
---find-links https://download.pytorch.org/whl/torch_stable.html
+--index-url https://download.pytorch.org/whl/cu126
 
-torch==1.11.0+cu113
-torchvision==0.12.0+cu113
+torch
+torchvision
 
 matplotlib>=3.2.2
 numpy>=1.18.5
