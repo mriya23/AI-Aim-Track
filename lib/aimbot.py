@@ -11,6 +11,24 @@ import torch
 import uuid
 import win32api
 import winsound
+import random
+import gc
+import psutil
+try:
+    import pycuda.autoinit
+    import pycuda.driver as cuda
+    import tensorrt as trt
+    TRS_AVAILABLE = True
+except ImportError:
+    TRS_AVAILABLE = False
+
+# HIGH PRIORITY PROCESS BOOST
+try:
+    p = psutil.Process(os.getpid())
+    p.nice(psutil.HIGH_PRIORITY_CLASS)
+    print(colored("[+] Process Priority set to HIGH", "green")) 
+except:
+    pass
 
 from termcolor import colored
 
@@ -57,6 +75,121 @@ class Input(ctypes.Structure):
 class POINT(ctypes.Structure):
     _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
 
+class TRTModel:
+    def __init__(self, engine_path):
+        self.logger = trt.Logger(trt.Logger.INFO)
+        with open(engine_path, "rb") as f, trt.Runtime(self.logger) as runtime:
+            self.engine = runtime.deserialize_cuda_engine(f.read())
+        self.context = self.engine.create_execution_context()
+        self.inputs = []
+        self.outputs = []
+        self.bindings = []
+        self.stream = cuda.Stream()
+        
+        for i in range(self.engine.num_io_tensors):
+            name = self.engine.get_tensor_name(i)
+            dtype = trt.nptype(self.engine.get_tensor_dtype(name))
+            shape = self.engine.get_tensor_shape(name)
+            size = trt.volume(shape)
+            host_mem = cuda.pagelocked_empty(size, dtype)
+            device_mem = cuda.mem_alloc(host_mem.nbytes)
+            self.bindings.append(int(device_mem))
+            if self.engine.get_tensor_mode(name) == trt.TensorIOMode.INPUT:
+                self.inputs.append({'host': host_mem, 'device': device_mem, 'name': name})
+            else:
+                self.outputs.append({'host': host_mem, 'device': device_mem, 'name': name})
+
+    def __call__(self, img):
+        # Image preprocessing
+        # RESIZE to 320x320
+        img_resized = cv2.resize(img, (320, 320))
+        img_resized = img_resized.astype(np.float32) / 255.0
+        img_resized = np.transpose(img_resized, (2, 0, 1))
+        img_resized = np.expand_dims(img_resized, axis=0)
+        img_resized = np.ascontiguousarray(img_resized)
+        
+        # Copy to input buffer
+        self.inputs[0]['host'][:] = img_resized.flatten()
+        cuda.memcpy_htod_async(self.inputs[0]['device'], self.inputs[0]['host'], self.stream)
+        
+        # Bindings for V3
+        for i in range(len(self.bindings)):
+            self.context.set_tensor_address(self.engine.get_tensor_name(i), self.bindings[i])
+            
+        # Execute
+        self.context.execute_async_v3(stream_handle=self.stream.handle)
+        
+        # Result back to host
+        for out in self.outputs:
+            cuda.memcpy_dtoh_async(out['host'], out['device'], self.stream)
+        self.stream.synchronize()
+        
+        return [out['host'] for out in self.outputs]
+
+    def half(self): pass # Compatibility
+
+
+class PIDController:
+    """
+    Professional PID Controller for smooth aim movement.
+    - P (Proportional): Reacts to current error (farther = faster)
+    - I (Integral): Eliminates steady-state error (ensures aim reaches target)
+    - D (Derivative): Prevents overshoot (smooth braking)
+    """
+    def __init__(self, kp=0.7, ki=0.05, kd=0.15):
+        self.kp = kp
+        self.ki = ki
+        self.kd = kd
+        self.integral_x = 0
+        self.integral_y = 0
+        self.prev_error_x = 0
+        self.prev_error_y = 0
+        self.prev_time = time.perf_counter()
+        # Anti-windup limits
+        self.integral_limit = 50
+        
+    def update(self, error_x, error_y):
+        """Calculate PID output for X and Y axes"""
+        current_time = time.perf_counter()
+        dt = current_time - self.prev_time
+        if dt <= 0:
+            dt = 0.016  # Fallback to ~60fps
+        
+        # Proportional term
+        p_x = self.kp * error_x
+        p_y = self.kp * error_y
+        
+        # Integral term (with anti-windup)
+        self.integral_x += error_x * dt
+        self.integral_y += error_y * dt
+        self.integral_x = max(-self.integral_limit, min(self.integral_limit, self.integral_x))
+        self.integral_y = max(-self.integral_limit, min(self.integral_limit, self.integral_y))
+        i_x = self.ki * self.integral_x
+        i_y = self.ki * self.integral_y
+        
+        # Derivative term
+        d_x = self.kd * (error_x - self.prev_error_x) / dt
+        d_y = self.kd * (error_y - self.prev_error_y) / dt
+        
+        # Store for next iteration
+        self.prev_error_x = error_x
+        self.prev_error_y = error_y
+        self.prev_time = current_time
+        
+        # Combined output
+        output_x = p_x + i_x + d_x
+        output_y = p_y + i_y + d_y
+        
+        return output_x, output_y
+    
+    def reset(self):
+        """Reset PID state when target is lost"""
+        self.integral_x = 0
+        self.integral_y = 0
+        self.prev_error_x = 0
+        self.prev_error_y = 0
+
+
 
 class Aimbot:
     extra = ctypes.c_ulong(0)
@@ -67,12 +200,19 @@ class Aimbot:
         sens_config = json.load(f)
     config_reload_time = 0
     
+    last_config_mtime = 0
+    
     @staticmethod
     def reload_config():
-        """Hot-reload config from file (called periodically)"""
+        """Hot-reload config from file only if modified"""
+        config_path = "lib/config/config.json"
         try:
-            with open("lib/config/config.json") as f:
-                Aimbot.sens_config = json.load(f)
+            mtime = os.path.getmtime(config_path)
+            if mtime > Aimbot.last_config_mtime:
+                with open(config_path) as f:
+                    Aimbot.sens_config = json.load(f)
+                Aimbot.last_config_mtime = mtime
+                # print("[INFO] Config reloaded") 
         except:
             pass
     aimbot_status = colored("ENABLED", 'green')
@@ -92,21 +232,39 @@ class Aimbot:
     prev_time = time.time()
     velocity_x = 0
     velocity_y = 0
+    
+    # PID Controller instance for smooth aim
+    pid_controller = PIDController(
+        kp=sens_config.get("pid_kp", 0.7),
+        ki=sens_config.get("pid_ki", 0.05),
+        kd=sens_config.get("pid_kd", 0.15)
+    )
 
     def __init__(self, box_constant = 416, collect_data = False, mouse_delay = 0.0005, debug = False):
-        #controls the initial centered box width and height of the "Lunar Vision" window
-        self.box_constant = box_constant #controls the size of the detection box (equaling the width and height)
+        # ROI Size from config (smaller = faster FPS)
+        config_roi = Aimbot.sens_config.get("roi_size", 320)
+        self.box_constant = config_roi  # Use config value for detection box size
 
-        print("[INFO] Loading the neural network model")
-        self.model = torch.hub.load('ultralytics/yolov5', 'custom', path='lib/best.pt', force_reload = True)
-        if torch.cuda.is_available():
-            print(colored("CUDA ACCELERATION [ENABLED]", "green"))
+        engine_path = 'lib/best.engine'
+        if TRS_AVAILABLE and os.path.exists(engine_path):
+            print(colored(f"[+] TensorRT Engine FOUND ({engine_path})", "green"))
+            print(colored("[INFO] Initializing TensorRT Inference Engine...", "cyan"))
+            self.model = TRTModel(engine_path)
+            self.using_trt = True
         else:
-            print(colored("[!] CUDA ACCELERATION IS UNAVAILABLE", "red"))
-            print(colored("[!] Check your PyTorch installation, else performance will be poor", "red"))
-
-        self.model.conf = 0.45 # base confidence threshold (or base detection (0-1)
-        self.model.iou = 0.45 # NMS IoU (0-1)
+            print(colored("[!] TensorRT Engine NOT FOUND or Library Missing", "yellow"))
+            print("[INFO] Falling back to PyTorch Inference...")
+            self.model = torch.hub.load('ultralytics/yolov5', 'custom', path='lib/best.pt', force_reload=False)
+            self.using_trt = False
+            
+            if torch.cuda.is_available():
+                print(colored("CUDA ACCELERATION [ENABLED]", "green"))
+                self.model.conf = 0.40
+                self.model.iou = 0.45
+                self.model.half()
+                print(colored("[+] FP16 Mode ENABLED - Faster inference", "green"))
+            else:
+                print(colored("[!] CUDA ACCELERATION IS UNAVAILABLE", "red"))
         self.collect_data = collect_data
         self.mouse_delay = mouse_delay
         self.debug = debug
@@ -155,10 +313,66 @@ class Aimbot:
     smooth_mom_x = 0
     smooth_mom_y = 0
 
+    def triggerbot(self, x, y):
+        """
+        Checks if the crosshair (center screen) is inside a detected target's bounding box.
+        If yes, and Triggerbot is enabled, clicks the mouse.
+        """
+        if not Aimbot.sens_config.get("triggerbot_enabled", False):
+            return
+
+        # Check if crosshair is reasonably close to the target center (e.g. within 30px)
+        # We use the calculated target x,y which is the head position
+        # If the crosshair (960, 540) is close enough to the target (x, y), fire.
+        
+        # Calculate distance from crosshair to target
+        dist = math.dist((x, y), (960, 540))
+        
+        # Trigger radius (pixels) - configurable? let's hardcode a reasonable value for now or use config
+        trigger_radius = Aimbot.sens_config.get("trigger_radius", 15)
+
+        if dist <= trigger_radius:
+            # Check for delay
+            current_time = time.time()
+            last_shot = getattr(self, "last_shot_time", 0)
+            delay = Aimbot.sens_config.get("trigger_delay", 0.1)
+            
+            if current_time - last_shot > delay:
+                # Fire!
+                if INTERCEPTION_AVAILABLE:
+                    interception.left_click(clicks=1, interval=0.05)
+                self.last_shot_time = current_time
+
+    def rcs(self):
+        """
+        Recoil Control System: Pulls the mouse down when Left Click is held.
+        """
+        if not Aimbot.sens_config.get("rcs_enabled", False):
+            return
+
+        # Check if Left Mouse Button is held (VK_LBUTTON = 0x01)
+        if win32api.GetKeyState(0x01) < 0:
+            strength_y = Aimbot.sens_config.get("rcs_strength_y", 2)
+            strength_x = Aimbot.sens_config.get("rcs_strength_x", 0)
+            
+            # Simple constant pull down for now
+            # In a pro version, this would read weapon patterns, but generic pull is good for general use
+            if INTERCEPTION_AVAILABLE:
+                # Move pixel by pixel to be smooth
+                # We need to regulate this so it doesn't pull down instantly to the floor
+                # Execution happens every frame, so we keep values small
+                interception.move_relative(int(strength_x), int(strength_y))
+
     def move_crosshair(self, x, y):
-        # ONLY activate when right-click is held (ADS mode)
+        # Triggerbot check (Always active if enabled, even if not right-clicking? No, usually when aimed)
+        self.triggerbot(x, y)
+        
+        # RCS Logic (Runs independent of Right Click, usually on Left Click)
+        self.rcs()
+
+        # ONLY activate aim movement when right-click is held (ADS mode)
         if not Aimbot.is_targeted():
-            Aimbot.last_move_info = "Waiting for ADS (right-click)..."
+            Aimbot.last_move_info = "Waiting for ADS..."
             # Reset history
             Aimbot.prev_target_x = x
             Aimbot.prev_target_y = y
@@ -166,86 +380,99 @@ class Aimbot:
             Aimbot.smooth_mom_y = 0
             return
 
-        # 1. Calculate Raw Momentum
-        raw_dx = x - Aimbot.prev_target_x
-        raw_dy = y - Aimbot.prev_target_y
-        
-        # 2. Noise Filter / Deadzone
-        # Increased to 3px to kill bounding box "shaking" at high scale
-        if abs(raw_dx) < 3: raw_dx = 0
-        if abs(raw_dy) < 3: raw_dy = 0
-        
-        # 3. Momentum Smoothing (EMA Filter)
-        # Deep filtering (20% new, 80% prev) for inertia-like stability
-        Aimbot.smooth_mom_x = (raw_dx * 0.2) + (Aimbot.smooth_mom_x * 0.8)
-        Aimbot.smooth_mom_y = (raw_dy * 0.2) + (Aimbot.smooth_mom_y * 0.8)
-        
-        # 4. Momentum Prediction
-        # Factor 5.5: Omega prediction for maximum "glue" effect
-        momentum_factor = 5.5
-        
-        if abs(raw_dx) > 60 or abs(raw_dy) > 60: # Snap protection
-            pred_x, pred_y = x, y
-        else:
-            pred_x = x + (Aimbot.smooth_mom_x * momentum_factor)
-            pred_y = y + (Aimbot.smooth_mom_y * momentum_factor)
-
-        # Update position history
-        Aimbot.prev_target_x = x
-        Aimbot.prev_target_y = y
-
-        # 5. Sensitivity & Speed Calculation
-        scale = Aimbot.sens_config.get("scale", Aimbot.sens_config.get("targeting_scale", 65.0))
-        
-        # Sensitivity controls movement speed (how much to move per frame)
-        sensitivity = Aimbot.sens_config.get("smoothing", 0.06)  # legacy name in config
-        
-        # X/Y Speed multipliers from config (GUI-controlled)
+        scale = Aimbot.sens_config.get("scale", 65.0) # Ensure default is 65.0
+        sensitivity = Aimbot.sens_config.get("smoothing", 0.06)
         x_speed = Aimbot.sens_config.get("x_speed", 1.0)
         y_speed = Aimbot.sens_config.get("y_speed", 1.0)
-            
-        diff_x = int((pred_x - 960) * scale / 10 * sensitivity * x_speed)
-        diff_y = int((pred_y - 540) * scale / 10 * sensitivity * y_speed)
-        
-        # Store debug info
-        Aimbot.last_move_info = f"Move: dx={diff_x}, dy={diff_y}"
-        
-        if diff_x == 0 and diff_y == 0:
-            return
-        
-        # 6. Execute Movement with TRUE SMOOTHNESS
-        # Smoothness value controls how many micro-steps to use
         smoothness = Aimbot.sens_config.get("smoothness", 0.5)
+
+        # === RAGE / BRUTAL MODE Logic (If smoothness < 0.2) ===
+        if smoothness < 0.2:
+            # DIRECT RAW OFFSET (No Filtering, No Prediction, No Smoothing)
+            raw_offset_x = (x - 960)
+            raw_offset_y = (y - 540)
+            
+            # Apply only sensitivity/speed scaling
+            diff_x = int(raw_offset_x * scale / 10 * sensitivity * x_speed)
+            diff_y = int(raw_offset_y * scale / 10 * sensitivity * y_speed)
+            
+            if INTERCEPTION_AVAILABLE:
+                interception.move_relative(diff_x, diff_y)
+            
+            Aimbot.last_move_info = f"RAGE PULL: {diff_x}, {diff_y}"
+            return
+        # ===============================================
+
+        # === LEGIT MODE WITH PID CONTROLLER ===
+        # Professional-grade aim smoothing using P.I.D. algorithm
         
-        # Calculate base steps: 3 to 15 based on GUI slider
-        base_steps = int(3 + smoothness * 12)
+        pid_enabled = Aimbot.sens_config.get("pid_enabled", True)
         
-        # Additional steps based on distance (to keep long flicks smooth)
-        abs_dx, abs_dy = abs(diff_x), abs(diff_y)
-        dist = math.sqrt(abs_dx**2 + abs_dy**2)
-        dist_steps = int(dist / 5) # 1 extra step for every 5px
-        
-        # Total steps (capped to prevent lag)
-        steps = min(30, base_steps + dist_steps)
-        
-        if INTERCEPTION_AVAILABLE:
-            try:
-                if abs_dx > 1 or abs_dy > 1:
-                    sx, sy = diff_x / steps, diff_y / steps
-                    remainder_x, remainder_y = 0.0, 0.0
-                    for _ in range(steps):
-                        remainder_x += sx
-                        remainder_y += sy
-                        move_x = int(remainder_x)
-                        move_y = int(remainder_y)
-                        remainder_x -= move_x
-                        remainder_y -= move_y
-                        if move_x != 0 or move_y != 0:
-                            interception.move_relative(move_x, move_y)
-                else:
-                    interception.move_relative(diff_x, diff_y)
-            except:
-                pass
+        if pid_enabled:
+            # Update PID parameters from config (hot-reload)
+            Aimbot.pid_controller.kp = Aimbot.sens_config.get("pid_kp", 0.7)
+            Aimbot.pid_controller.ki = Aimbot.sens_config.get("pid_ki", 0.05)
+            Aimbot.pid_controller.kd = Aimbot.sens_config.get("pid_kd", 0.15)
+            
+            # Calculate error (distance from crosshair to target)
+            error_x = x - 960  # Target X - Screen Center X
+            error_y = y - 540  # Target Y - Screen Center Y
+            
+            # DEADZONE: If very close, STOP completely (Prevents shake)
+            if abs(error_x) < 4 and abs(error_y) < 4:
+                Aimbot.pid_controller.reset() # Reset I-term so it doesn't wind up
+                return
+            
+            # Get PID output (how much to move)
+            pid_out_x, pid_out_y = Aimbot.pid_controller.update(error_x, error_y)
+            
+            # Apply speed scaling
+            diff_x = pid_out_x * scale / 100 * x_speed
+            diff_y = pid_out_y * scale / 100 * y_speed
+            
+            # CAP maximum movement
+            max_move = 60
+            diff_x = max(-max_move, min(max_move, diff_x))
+            diff_y = max(-max_move, min(max_move, diff_y))
+            
+            # FILTER: Ignore very small movements (Anti-Jitter)
+            if abs(diff_x) < 1.0 and abs(diff_y) < 1.0:
+                return
+
+            diff_x = int(diff_x)
+            diff_y = int(diff_y)
+            
+            if diff_x == 0 and diff_y == 0:
+                return
+            
+            # Execute movement
+            if INTERCEPTION_AVAILABLE:
+                interception.move_relative(diff_x, diff_y)
+        else:
+            # FALLBACK: CLASSIC SIMPLE SMOOTHING (STABLE)
+            # 1. Calculate offset
+            offset_x = x - 960
+            offset_y = y - 540
+            
+            # 3. ABSOLUTE LOCK LOGIC (Jitter Fix)
+            # Extremely dampened sensitivity
+            # Divisor 200 = Heavy dampening to stop left-right overshoot
+            diff_x = (offset_x * scale * sensitivity * x_speed) / 200
+            diff_y = (offset_y * scale * sensitivity * y_speed) / 200
+            
+            # HARD CAP: Increased to 25px for faster flicks
+            limit = 25
+            diff_x = max(-limit, min(limit, diff_x))
+            diff_y = max(-limit, min(limit, diff_y))
+
+            # 4. DIRECT EXECUTION
+            move_x = int(diff_x)
+            move_y = int(diff_y)
+            
+            if move_x != 0 or move_y != 0:
+                if INTERCEPTION_AVAILABLE:
+                    interception.move_relative(move_x, move_y)
+
 
     #generator yields pixel tuples for relative movement
     def interpolate_coordinates_from_center(absolute_coordinates, scale):
@@ -284,38 +511,91 @@ class Aimbot:
                 Aimbot.config_reload_time = time.perf_counter()
             
             frame = np.array(Aimbot.screen.grab(detection_box))
+            # Convert BGRA to BGR and make contiguous for OpenCV
+            frame = np.ascontiguousarray(frame[:, :, :3])
+            
             if self.collect_data: orig_frame = np.copy((frame))
-            results = self.model(frame)
+            
+            # --- INFERENCE STEP ---
+            if self.using_trt:
+                # TensorRT Path
+                raw_results = self.model(frame)
+                # Custom YOLOv5 model: 6 columns = [x, y, w, h, conf, class]
+                # (5 + 1 class, not 85 like COCO)
+                num_cols = 6
+                output = raw_results[0].reshape(-1, num_cols)
+                # Use config value for confidence to avoid false positives (aim pulling down)
+                conf_thres = Aimbot.sens_config.get("conf_thres", 0.45)
+                valid = output[output[:, 4] > conf_thres]
+                
+                # SCALING: TensorRT uses 320x320, Screen ROI is self.box_constant (usually 400)
+                scale_factor = self.box_constant / 320.0
+                
+                det_list = []
+                for row in valid:
+                    # [x_center, y_center, w, h, conf, class]
+                    box = row[:4]
+                    conf = row[4]
+                    # Convert to xyxy and SCALE to ROI size
+                    x1 = int((box[0] - box[2]/2) * scale_factor)
+                    y1 = int((box[1] - box[3]/2) * scale_factor)
+                    x2 = int((box[0] + box[2]/2) * scale_factor)
+                    y2 = int((box[1] + box[3]/2) * scale_factor)
+                    det_list.append([x1, y1, x2, y2, conf])
+                results_xyxy = det_list
+            else:
+                # PyTorch Path
+                results = self.model(frame)
+                results_xyxy = []
+                if len(results.xyxy[0]) > 0:
+                    for *box, conf, cls in results.xyxy[0]:
+                        results_xyxy.append([int(box[0]), int(box[1]), int(box[2]), int(box[3]), conf.item()])
 
-            if len(results.xyxy[0]) != 0: #player detected
+            # --- PROCESSING STEP ---
+            if len(results_xyxy) != 0: #player detected
                 least_crosshair_dist = closest_detection = player_in_frame = False
-                for *box, conf, cls in results.xyxy[0]: #iterate over each player detected
-                    x1y1 = [int(x.item()) for x in box[:2]]
-                    x2y2 = [int(x.item()) for x in box[2:]]
-                    x1, y1, x2, y2, conf = *x1y1, *x2y2, conf.item()
-                    height = y2 - y1
+                for x1, y1, x2, y2, conf in results_xyxy: #iterate over each player detected
+                    w = x2 - x1
+                    h = y2 - y1
+                    if w == 0 or h == 0: continue
+                    
+                    # --- SMART FILTER (Dynamic Logic) ---
+                    # 1. Aspect Ratio Filter: Ignore flat boxes (shadows/ground)
+                    aspect_ratio = h / w
+                    if aspect_ratio < 0.6: 
+                        continue # Target is too flat/wide -> Likely not a standing player
+                    
+                    # 2. Bottom Border Filter: Ignore detections touching bottom of ROI (hands/weapon)
+                    if y2 > self.box_constant - 5:
+                        continue
+                    
                     # Calculate head position - use configurable aim_point_ratio from config
                     aim_ratio = Aimbot.sens_config.get("aim_point_ratio", 0.10)
-                    relative_head_X, relative_head_Y = int((x1 + x2)/2), int(y1 + height * aim_ratio)
-                    own_player = x1 < 15 or (x1 < self.box_constant/5 and y2 > self.box_constant/1.2) #helps ensure that your own player is not regarded as a valid detection
+                    relative_head_X, relative_head_Y = int((x1 + x2)/2), int(y1 + h * aim_ratio)
+                    own_player = x1 < 15 or (x1 < self.box_constant/5 and y2 > self.box_constant/1.2) 
+                    
+                    x1y1 = (x1, y1)
+                    x2y2 = (x2, y2)
 
-                    #calculate the distance between each detection and the crosshair at (self.box_constant/2, self.box_constant/2)
+                    #calculate the distance between each detection and the crosshair
                     crosshair_dist = math.dist((relative_head_X, relative_head_Y), (self.box_constant/2, self.box_constant/2))
+                    
+                    if not least_crosshair_dist: least_crosshair_dist = crosshair_dist
 
-                    if not least_crosshair_dist: least_crosshair_dist = crosshair_dist #initalize least crosshair distance variable first iteration
-
-                    # FOV Filter: Ignore targets outside the configured radius
+                    # FOV Filter
                     fov_radius = Aimbot.sens_config.get("fov_radius", 150)
                     if crosshair_dist > fov_radius:
-                        continue  # Skip this target - too far from crosshair
+                        continue 
 
                     if crosshair_dist <= least_crosshair_dist and not own_player:
                         least_crosshair_dist = crosshair_dist
                         closest_detection = {"x1y1": x1y1, "x2y2": x2y2, "relative_head_X": relative_head_X, "relative_head_Y": relative_head_Y, "conf": conf, "crosshair_dist": crosshair_dist}
 
                     if not own_player:
-                        cv2.rectangle(frame, x1y1, x2y2, (244, 113, 115), 2) #draw the bounding boxes for all of the player detections (except own)
-                        cv2.putText(frame, f"{int(conf * 100)}%", x1y1, cv2.FONT_HERSHEY_DUPLEX, 0.5, (244, 113, 116), 2) #draw the confidence labels on the bounding boxes
+                        # Draw box - Color based on confidence (Visual Debug)
+                        color = (0, 255, 0) if conf > 0.6 else (0, 165, 255) # Green = High Conf, Orange = Low
+                        cv2.rectangle(frame, x1y1, x2y2, color, 2) 
+                        cv2.putText(frame, f"{int(conf * 100)}%", x1y1, cv2.FONT_HERSHEY_DUPLEX, 0.5, color, 2) 
                     else:
                         own_player = False
                         if not player_in_frame:
@@ -332,9 +612,9 @@ class Aimbot:
                         # Find detection closest to the LOCKED position (not crosshair)
                         best_dist_to_lock = 100 # Threshold distance in pixels
                         
-                        for *box, conf, cls in results.xyxy[0]:
-                            bx1, by1 = int(box[0].item()), int(box[1].item())
-                            bx2, by2 = int(box[2].item()), int(box[3].item())
+                        for x1, y1, x2, y2, conf in results_xyxy:
+                            bx1, by1 = x1, y1
+                            bx2, by2 = x2, y2
                             bh = by2 - by1
                             # Correct head calculation for distance check
                             check_head_x, check_head_y = int((bx1 + bx2)/2), int(by1 + bh/10)
@@ -352,7 +632,7 @@ class Aimbot:
                                     "x2y2": [bx2, by2], 
                                     "relative_head_X": check_head_x, 
                                     "relative_head_Y": check_head_y, 
-                                    "conf": conf.item()
+                                    "conf": conf
                                 }
                     
                     if locked_detection:
@@ -386,32 +666,40 @@ class Aimbot:
                 cv2.imwrite(f"lib/data/{str(uuid.uuid4())}.jpg", orig_frame)
                 collect_pause = time.perf_counter()
             
-            cv2.putText(frame, f"FPS: {int(1/(time.perf_counter() - start_time))}", (5, 30), cv2.FONT_HERSHEY_DUPLEX, 1, (113, 116, 244), 2)
-            
-            # Show debug movement info
-            if Aimbot.last_move_info:
-                cv2.putText(frame, Aimbot.last_move_info, (5, 60), cv2.FONT_HERSHEY_DUPLEX, 0.5, (255, 255, 0), 1)
-            
-            # Show aimbot status overlay for a few seconds after toggle
-            if time.time() - Aimbot.status_display_time < Aimbot.status_display_duration:
-                if Aimbot.is_aimbot_enabled():
-                    status_text = "AIMBOT: ON"
-                    status_color = (0, 255, 0)  # Green
-                else:
-                    status_text = "AIMBOT: OFF"
-                    status_color = (0, 0, 255)  # Red
-                # Draw background rectangle for better visibility
-                cv2.rectangle(frame, (self.box_constant//2 - 100, 50), (self.box_constant//2 + 100, 90), (0, 0, 0), -1)
-                cv2.putText(frame, status_text, (self.box_constant//2 - 90, 80), cv2.FONT_HERSHEY_DUPLEX, 1, status_color, 2)
-            
-            # Draw FOV Circle (always visible)
-            fov_radius = Aimbot.sens_config.get("fov_radius", 150)
-            center = (self.box_constant // 2, self.box_constant // 2)
-            cv2.circle(frame, center, fov_radius, (0, 255, 255), 2)  # Yellow circle
-            
-            cv2.imshow("AI AIMBOT", frame)
-            if cv2.waitKey(1) & 0xFF == ord('0'):
-                break
+            # ------------------ VISUALIZATION START ------------------
+            # Only draw and show window if NOT in headless mode
+            if not Aimbot.sens_config.get("headless", False):
+                cv2.putText(frame, f"FPS: {int(1/(time.perf_counter() - start_time))}", (5, 30), cv2.FONT_HERSHEY_DUPLEX, 1, (113, 116, 244), 2)
+                
+                # Show debug movement info
+                if Aimbot.last_move_info:
+                    cv2.putText(frame, Aimbot.last_move_info, (5, 60), cv2.FONT_HERSHEY_DUPLEX, 0.5, (255, 255, 0), 1)
+                
+                # Show aimbot status overlay for a few seconds after toggle
+                if time.time() - Aimbot.status_display_time < Aimbot.status_display_duration:
+                    if Aimbot.is_aimbot_enabled():
+                        status_text = "AIMBOT: ON"
+                        status_color = (0, 255, 0)  # Green
+                    else:
+                        status_text = "AIMBOT: OFF"
+                        status_color = (0, 0, 255)  # Red
+                    # Draw background rectangle for better visibility
+                    cv2.rectangle(frame, (self.box_constant//2 - 100, 50), (self.box_constant//2 + 100, 90), (0, 0, 0), -1)
+                    cv2.putText(frame, status_text, (self.box_constant//2 - 90, 80), cv2.FONT_HERSHEY_DUPLEX, 1, status_color, 2)
+                
+                # Draw FOV Circle (always visible)
+                fov_radius = Aimbot.sens_config.get("fov_radius", 150)
+                center = (self.box_constant // 2, self.box_constant // 2)
+                cv2.circle(frame, center, fov_radius, (0, 255, 255), 2)  # Yellow circle
+                
+                cv2.imshow("AI AIMBOT", frame)
+                if cv2.waitKey(1) & 0xFF == ord('0'):
+                    break
+            else:
+                # Headless Mode:
+                # Just sleep briefly to prevent 100% CPU usage if needed, though pytorch inference usually takes time.
+                pass
+            # ------------------ VISUALIZATION END ------------------
 
     def clean_up():
         print("\n[INFO] F2 WAS PRESSED. QUITTING...")

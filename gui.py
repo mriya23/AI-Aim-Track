@@ -1,391 +1,228 @@
-"""
-AI AIMBOT - Desktop GUI Application
-Built with CustomTkinter
-"""
-
 import customtkinter as ctk
 import json
 import os
 import threading
 import sys
+import tkinter.messagebox
 
-# Set appearance
-ctk.set_appearance_mode("dark")
+# --- Appearance Settings ---
+ctk.set_appearance_mode("Dark")
 ctk.set_default_color_theme("blue")
 
-CONFIG_PATH = "lib/config/config.json"
-
-class AIAimbotGUI(ctk.CTk):
+class GUI(ctk.CTk):
     def __init__(self):
         super().__init__()
-        
-        # Window setup
-        self.title("AI AIMBOT")
-        self.geometry("500x750")
-        self.resizable(False, True)  # Allow vertical resize
+        self.title("🎯 LUNAR AIMBOT")
+        self.geometry("420x680")
+        self.resizable(False, False)
         
         # Load config
-        self.config = self.load_config()
+        self.config_file = "lib/config/config.json"
+        self.load_config()
+
+        # --- MAIN FRAME ---
+        self.main_frame = ctk.CTkFrame(self, fg_color="transparent")
+        self.main_frame.pack(fill="both", expand=True, padx=10, pady=10)
         
-        # Offset presets
-        self.offset_presets = {
-            "Head": 0.10,
-            "Neck": 0.20,
-            "Chest": 0.35,
-            "Body": 0.50
-        }
+        # === HEADER ===
+        header = ctk.CTkFrame(self.main_frame, fg_color="#1a1a2e", corner_radius=10)
+        header.pack(fill="x", pady=(0,10))
+        ctk.CTkLabel(header, text="🎯 LUNAR", font=("Roboto", 24, "bold"), text_color="#e94560").pack(side="left", padx=15, pady=10)
         
-        # Create UI
-        self.create_widgets()
+        self.status_label = ctk.CTkLabel(header, text="● READY", text_color="#00ff88", font=("Roboto", 12, "bold"))
+        self.status_label.pack(side="right", padx=15)
+
+        # === TOGGLE SWITCHES ===
+        toggles = ctk.CTkFrame(self.main_frame, fg_color="#16213e", corner_radius=10)
+        toggles.pack(fill="x", pady=5)
         
-        # Aimbot process reference
-        self.aimbot_process = None
+        self.switch_enabled = ctk.CTkSwitch(toggles, text="AIMBOT", command=self.on_enable_toggle, 
+                                            progress_color="#e94560", font=("Roboto", 12, "bold"))
+        self.switch_enabled.pack(side="left", padx=15, pady=10)
+        if self.config.get("enabled", True): self.switch_enabled.select()
         
-    def load_config(self):
-        """Load configuration from JSON file"""
-        default_config = {
-            "enabled": True,
-            "fov_radius": 150,
-            "offset_preset": "Head",
-            "aim_point_ratio": 0.10,
-            "x_speed": 1.0,
-            "y_speed": 1.0,
-            "smoothing": 0.06,
-            "scale": 65.0,
-            "prediction": 5.5,
-            "second_instance": False
-        }
+        self.switch_trigger = ctk.CTkSwitch(toggles, text="TRIGGERBOT", command=self.on_trigger_toggle,
+                                           progress_color="#e94560", font=("Roboto", 12, "bold"))
+        self.switch_trigger.pack(side="left", padx=15, pady=10)
+        if self.config.get("triggerbot_enabled", False): self.switch_trigger.select()
         
-        try:
-            with open(CONFIG_PATH, 'r') as f:
-                loaded = json.load(f)
-                # Merge with defaults
-                for key in default_config:
-                    if key not in loaded:
-                        loaded[key] = default_config[key]
-                return loaded
-        except:
-            return default_config
-    
-    def save_config(self):
-        """Save configuration to JSON file"""
-        os.makedirs(os.path.dirname(CONFIG_PATH), exist_ok=True)
-        with open(CONFIG_PATH, 'w') as f:
-            json.dump(self.config, f, indent=4)
-        print("[GUI] Config saved!")
-    
-    def create_widgets(self):
-        """Create all GUI widgets"""
-        
-        # Create scrollable container
-        self.scroll_frame = ctk.CTkScrollableFrame(self, width=480, height=700)
-        self.scroll_frame.pack(fill="both", expand=True, padx=10, pady=10)
-        
-        # Title
-        title = ctk.CTkLabel(
-            self.scroll_frame, 
-            text="🎯 AI AIMBOT", 
-            font=ctk.CTkFont(size=28, weight="bold")
-        )
-        title.pack(pady=20)
-        
-        # === Enable/Disable Section ===
-        enable_frame = ctk.CTkFrame(self.scroll_frame)
-        enable_frame.pack(fill="x", padx=20, pady=10)
-        
-        self.enable_var = ctk.BooleanVar(value=self.config.get("enabled", True))
-        self.enable_switch = ctk.CTkSwitch(
-            enable_frame,
-            text="Aimbot Enabled",
-            variable=self.enable_var,
-            command=self.on_enable_toggle,
-            font=ctk.CTkFont(size=16, weight="bold")
-        )
-        self.enable_switch.pack(pady=15)
-        
-        # === Targeting Section ===
-        targeting_label = ctk.CTkLabel(
-            self.scroll_frame, 
-            text="─── Targeting ───", 
-            font=ctk.CTkFont(size=14)
-        )
-        targeting_label.pack(pady=(10, 5))
-        
-        targeting_frame = ctk.CTkFrame(self.scroll_frame)
-        targeting_frame.pack(fill="x", padx=20, pady=5)
+        self.switch_rcs = ctk.CTkSwitch(toggles, text="RCS", command=self.on_rcs_toggle,
+                                       progress_color="#e94560", font=("Roboto", 12, "bold"))
+        self.switch_rcs.pack(side="left", padx=15, pady=10)
+        if self.config.get("rcs_enabled", False): self.switch_rcs.select()
+
+        # === AIM SETTINGS ===
+        aim_frame = ctk.CTkFrame(self.main_frame, fg_color="#16213e", corner_radius=10)
+        aim_frame.pack(fill="x", pady=5)
+        ctk.CTkLabel(aim_frame, text="AIM SETTINGS", font=("Roboto", 11, "bold"), text_color="#e94560").pack(anchor="w", padx=10, pady=(8,5))
         
         # FOV Radius
-        fov_label = ctk.CTkLabel(targeting_frame, text="FOV Radius:")
-        fov_label.grid(row=0, column=0, padx=10, pady=10, sticky="w")
+        self.create_slider(aim_frame, "FOV Radius", "fov_radius", 10, 800, int)
+
+        # Bone Preset (Dropdown)
+        frame_bone = ctk.CTkFrame(aim_frame, fg_color="transparent")
+        frame_bone.pack(fill="x", padx=10, pady=2)
+        ctk.CTkLabel(frame_bone, text="Target Bone", font=("Roboto", 11), width=100, anchor="w").pack(side="left")
         
-        self.fov_value_label = ctk.CTkLabel(
-            targeting_frame, 
-            text=str(self.config.get("fov_radius", 150))
-        )
-        self.fov_value_label.grid(row=0, column=2, padx=10)
+        def on_bone_change(choice):
+            if choice == "Head": val = 0.12
+            elif choice == "Neck": val = 0.20
+            elif choice == "Chest": val = 0.30
+            else: val = 0.12
+            self.config["aim_point_ratio"] = val
+            self.save_config()
         
-        self.fov_slider = ctk.CTkSlider(
-            targeting_frame,
-            from_=50, to=300,
-            number_of_steps=25,
-            command=self.on_fov_change
-        )
-        self.fov_slider.set(self.config.get("fov_radius", 150))
-        self.fov_slider.grid(row=0, column=1, padx=10, pady=10)
+        self.bone_option = ctk.CTkOptionMenu(frame_bone, values=["Head", "Neck", "Chest"], command=on_bone_change,
+                                            fg_color="#e94560", button_color="#c73e54", button_hover_color="#de3b55")
+        self.bone_option.pack(side="left", expand=True, fill="x", padx=10)
+        self.bone_option.set("Head") 
+
+        # Manual Offset
+        self.create_slider(aim_frame, "Offset (Vertical)", "aim_point_ratio", 0.0, 0.5, float)
         
-        # Offset Preset
-        preset_label = ctk.CTkLabel(targeting_frame, text="Offset Preset:")
-        preset_label.grid(row=1, column=0, padx=10, pady=10, sticky="w")
+        # Speed X
+        self.create_slider(aim_frame, "Aim Speed X", "x_speed", 0.1, 8.0, float)
+        # Speed Y
+        self.create_slider(aim_frame, "Aim Speed Y", "y_speed", 0.1, 8.0, float)
         
-        self.preset_var = ctk.StringVar(value=self.config.get("offset_preset", "Head"))
-        self.preset_dropdown = ctk.CTkOptionMenu(
-            targeting_frame,
-            values=list(self.offset_presets.keys()),
-            variable=self.preset_var,
-            command=self.on_preset_change
-        )
-        self.preset_dropdown.grid(row=1, column=1, padx=10, pady=10, columnspan=2)
+        # Smoothing
+        self.create_slider(aim_frame, "Smoothing", "smoothing", 0.05, 1.0, float)
         
-        # Offset Manual
-        offset_label = ctk.CTkLabel(targeting_frame, text="Offset (Manual):")
-        offset_label.grid(row=2, column=0, padx=10, pady=10, sticky="w")
+        # === TRIGGER SETTINGS ===
+        trigger_frame = ctk.CTkFrame(self.main_frame, fg_color="#16213e", corner_radius=10)
+        trigger_frame.pack(fill="x", pady=5)
+        ctk.CTkLabel(trigger_frame, text="TRIGGER SETTINGS", font=("Roboto", 11, "bold"), text_color="#e94560").pack(anchor="w", padx=10, pady=(8,5))
         
-        self.offset_entry = ctk.CTkEntry(targeting_frame, width=80)
-        self.offset_entry.insert(0, str(self.config.get("aim_point_ratio", 0.10)))
-        self.offset_entry.grid(row=2, column=1, padx=10, pady=10)
-        self.offset_entry.bind("<FocusOut>", self.on_offset_change)
+        self.create_slider(trigger_frame, "Trigger Radius", "trigger_radius", 1, 100, int)
+        self.create_slider(trigger_frame, "Delay (ms)", "trigger_delay", 0.0, 0.3, float, scale=1000)
+
+        # === ADVANCED ===
+        adv_frame = ctk.CTkFrame(self.main_frame, fg_color="#16213e", corner_radius=10)
+        adv_frame.pack(fill="x", pady=5)
+        ctk.CTkLabel(adv_frame, text="ADVANCED", font=("Roboto", 11, "bold"), text_color="#e94560").pack(anchor="w", padx=10, pady=(8,5))
         
-        # === Speed Section ===
-        speed_label = ctk.CTkLabel(
-            self, 
-            text="─── Aim Speed ───", 
-            font=ctk.CTkFont(size=14)
-        )
-        speed_label.pack(pady=(15, 5))
+        self.create_slider(adv_frame, "Data Scale", "scale", 10, 100, float)
+        self.create_slider(adv_frame, "Confidence", "conf_thres", 0.1, 0.9, float)
+
+        # === BUTTONS ===
+        btn_frame = ctk.CTkFrame(self.main_frame, fg_color="transparent")
+        btn_frame.pack(fill="x", pady=10)
         
-        speed_frame = ctk.CTkFrame(self.scroll_frame)
-        speed_frame.pack(fill="x", padx=20, pady=5)
+        self.btn_start = ctk.CTkButton(btn_frame, text="▶ START", command=self.on_start,
+                                       fg_color="#e94560", hover_color="#c73e54", height=40,
+                                       font=("Roboto", 14, "bold"))
+        self.btn_start.pack(side="left", expand=True, fill="x", padx=5)
         
-        # X-Speed
-        x_label = ctk.CTkLabel(speed_frame, text="X-Speed:")
-        x_label.grid(row=0, column=0, padx=10, pady=10, sticky="w")
+        ctk.CTkButton(btn_frame, text="💾 SAVE", command=self.save_config,
+                     fg_color="#0f3460", hover_color="#1a4a7a", height=40,
+                     font=("Roboto", 14, "bold")).pack(side="left", expand=True, fill="x", padx=5)
+
+        # === FOOTER ===
+        ctk.CTkLabel(self.main_frame, text="F1 = Toggle | F2 = Exit", 
+                    text_color="#666", font=("Roboto", 10)).pack(pady=5)
+
+    def create_slider(self, parent, label, config_key, min_val, max_val, val_type, scale=1):
+        """Helper to create compact slider with label"""
+        frame = ctk.CTkFrame(parent, fg_color="transparent")
+        frame.pack(fill="x", padx=10, pady=2)
         
-        self.x_speed_label = ctk.CTkLabel(
-            speed_frame, 
-            text=f"{self.config.get('x_speed', 1.0):.2f}"
-        )
-        self.x_speed_label.grid(row=0, column=2, padx=10)
+        ctk.CTkLabel(frame, text=label, font=("Roboto", 11), width=100, anchor="w").pack(side="left")
         
-        self.x_speed_slider = ctk.CTkSlider(
-            speed_frame,
-            from_=0.1, to=5.0,
-            number_of_steps=49,
-            command=self.on_x_speed_change
-        )
-        self.x_speed_slider.set(self.config.get("x_speed", 1.0))
-        self.x_speed_slider.grid(row=0, column=1, padx=10, pady=10)
+        current = self.config.get(config_key, min_val)
         
-        # Y-Speed
-        y_label = ctk.CTkLabel(speed_frame, text="Y-Speed:")
-        y_label.grid(row=1, column=0, padx=10, pady=10, sticky="w")
-        
-        self.y_speed_label = ctk.CTkLabel(
-            speed_frame, 
-            text=f"{self.config.get('y_speed', 1.0):.2f}"
-        )
-        self.y_speed_label.grid(row=1, column=2, padx=10)
-        
-        self.y_speed_slider = ctk.CTkSlider(
-            speed_frame,
-            from_=0.1, to=5.0,
-            number_of_steps=49,
-            command=self.on_y_speed_change
-        )
-        self.y_speed_slider.set(self.config.get("y_speed", 1.0))
-        self.y_speed_slider.grid(row=1, column=1, padx=10, pady=10)
-        
-        # === Smoothing Section ===
-        smooth_label = ctk.CTkLabel(
-            self, 
-            text="─── Sensitivity ───", 
-            font=ctk.CTkFont(size=14)
-        )
-        smooth_label.pack(pady=(15, 5))
-        
-        smooth_frame = ctk.CTkFrame(self.scroll_frame)
-        smooth_frame.pack(fill="x", padx=20, pady=5)
-        
-        sens_text = ctk.CTkLabel(smooth_frame, text="Sensitivity:")
-        sens_text.grid(row=0, column=0, padx=10, pady=10, sticky="w")
-        
-        self.smooth_value_label = ctk.CTkLabel(
-            smooth_frame, 
-            text=f"{self.config.get('smoothing', 0.06):.2f}"
-        )
-        self.smooth_value_label.grid(row=0, column=2, padx=10)
-        
-        self.smooth_slider = ctk.CTkSlider(
-            smooth_frame,
-            from_=0.01, to=1.0,
-            number_of_steps=99,
-            command=self.on_smooth_change
-        )
-        self.smooth_slider.set(self.config.get("smoothing", 0.06))
-        self.smooth_slider.grid(row=0, column=1, padx=10, pady=10)
-        
-        # Smoothness (TRUE smoothing - controls micro-step count)
-        smoothness_text = ctk.CTkLabel(smooth_frame, text="Smoothness:")
-        smoothness_text.grid(row=1, column=0, padx=10, pady=10, sticky="w")
-        
-        self.smoothness_value_label = ctk.CTkLabel(
-            smooth_frame, 
-            text=f"{self.config.get('smoothness', 0.5):.2f}"
-        )
-        self.smoothness_value_label.grid(row=1, column=2, padx=10)
-        
-        self.smoothness_slider = ctk.CTkSlider(
-            smooth_frame,
-            from_=0.1, to=1.0,
-            number_of_steps=18,
-            command=self.on_smoothness_change
-        )
-        self.smoothness_slider.set(self.config.get("smoothness", 0.5))
-        self.smoothness_slider.grid(row=1, column=1, padx=10, pady=10)
-        
-        # === Advanced Section ===
-        adv_label = ctk.CTkLabel(
-            self, 
-            text="─── Advanced ───", 
-            font=ctk.CTkFont(size=14)
-        )
-        adv_label.pack(pady=(15, 5))
-        
-        adv_frame = ctk.CTkFrame(self.scroll_frame)
-        adv_frame.pack(fill="x", padx=20, pady=5)
-        
-        # Second Instance
-        self.second_var = ctk.BooleanVar(value=self.config.get("second_instance", False))
-        self.second_switch = ctk.CTkSwitch(
-            adv_frame,
-            text="Second Aimbot Instance",
-            variable=self.second_var,
-            command=self.on_second_toggle
-        )
-        self.second_switch.pack(pady=15)
-        
-        # === Buttons ===
-        button_frame = ctk.CTkFrame(self.scroll_frame, fg_color="transparent")
-        button_frame.pack(fill="x", padx=20, pady=20)
-        
-        self.save_btn = ctk.CTkButton(
-            button_frame,
-            text="💾 Save Settings",
-            command=self.on_save,
-            width=150
-        )
-        self.save_btn.pack(side="left", padx=10)
-        
-        self.start_btn = ctk.CTkButton(
-            button_frame,
-            text="▶ Start Aimbot",
-            command=self.on_start,
-            width=150,
-            fg_color="green",
-            hover_color="darkgreen"
-        )
-        self.start_btn.pack(side="right", padx=10)
-        
-        # Status bar
-        self.status_label = ctk.CTkLabel(
-            self,
-            text="Status: Ready",
-            font=ctk.CTkFont(size=12)
-        )
-        self.status_label.pack(pady=10)
-    
-    # === Event Handlers ===
-    def on_enable_toggle(self):
-        self.config["enabled"] = self.enable_var.get()
-        
-    def on_fov_change(self, value):
-        self.config["fov_radius"] = int(value)
-        self.fov_value_label.configure(text=str(int(value)))
-        
-    def on_preset_change(self, value):
-        self.config["offset_preset"] = value
-        ratio = self.offset_presets.get(value, 0.10)
-        self.config["aim_point_ratio"] = ratio
-        self.offset_entry.delete(0, "end")
-        self.offset_entry.insert(0, str(ratio))
-        
-    def on_offset_change(self, event):
-        try:
-            value = float(self.offset_entry.get())
-            value = max(0.0, min(1.0, value))
-            self.config["aim_point_ratio"] = value
-        except:
-            pass
+        # Dynamic scaler for label display
+        display_val = float(current) * scale
+        fmt = "{:.0f}" if (val_type == int or scale != 1) else "{:.2f}"
             
-    def on_x_speed_change(self, value):
-        self.config["x_speed"] = round(value, 2)
-        self.x_speed_label.configure(text=f"{value:.2f}")
+        value_label = ctk.CTkLabel(frame, text=fmt.format(display_val), 
+                                  font=("Roboto", 11), width=50)
+        value_label.pack(side="right")
         
-    def on_y_speed_change(self, value):
-        self.config["y_speed"] = round(value, 2)
-        self.y_speed_label.configure(text=f"{value:.2f}")
+        def on_change(val):
+            # Special case: If user moves X Speed slider, we CAN sync Y Speed if we want.
+            # But user asked for Separate X/Y. So we DO NOT sync automatically here anymore.
+            # Unless it's the specific "Speed" master slider which no longer exists.
+            
+            self.config[config_key] = val_type(val)
+            
+            display_val = float(val) * scale
+            value_label.configure(text=fmt.format(display_val))
+            self.save_config()
         
-    def on_smooth_change(self, value):
-        self.config["smoothing"] = round(value, 2)
-        self.smooth_value_label.configure(text=f"{value:.2f}")
-    
-    def on_smoothness_change(self, value):
-        self.config["smoothness"] = round(value, 2)
-        self.smoothness_value_label.configure(text=f"{value:.2f}")
-        
-    def on_second_toggle(self):
-        self.config["second_instance"] = self.second_var.get()
-        
-    def on_save(self):
+        slider = ctk.CTkSlider(frame, from_=min_val, to=max_val, command=on_change,
+                              progress_color="#e94560", button_color="#e94560")
+        slider.pack(side="left", expand=True, fill="x", padx=10)
+        slider.set(current)
+
+    # --- Callbacks ---
+    def load_config(self):
+        try:
+            with open(self.config_file, 'r') as f:
+                self.config = json.load(f)
+        except Exception:
+            self.config = {}
+
+    def save_config(self):
+        try:
+            os.makedirs(os.path.dirname(self.config_file), exist_ok=True)
+            with open(self.config_file, 'w') as f:
+                json.dump(self.config, f, indent=4)
+        except Exception as e:
+            pass
+
+    def on_enable_toggle(self):
+        self.config["enabled"] = bool(self.switch_enabled.get())
         self.save_config()
-        self.status_label.configure(text="Status: Settings Saved! ✓")
-        
+
+    def on_trigger_toggle(self):
+        self.config["triggerbot_enabled"] = bool(self.switch_trigger.get())
+        self.save_config()
+
+    def on_rcs_toggle(self):
+        self.config["rcs_enabled"] = bool(self.switch_rcs.get())
+        self.save_config()
+
     def on_start(self):
-        """Start the aimbot in a separate thread"""
         self.save_config()
-        self.status_label.configure(text="Status: Starting Aimbot...")
+        self.status_label.configure(text="● RUNNING", text_color="#00ff88")
+        self.btn_start.configure(text="● ACTIVE", state="disabled", fg_color="#0f3460")
         
-        # Import and run aimbot
-        def run_aimbot():
-            try:
-                from lib.aimbot import Aimbot
-                aimbot = Aimbot()
-                aimbot.start()
-            except Exception as e:
-                print(f"[ERROR] {e}")
-        
-        thread = threading.Thread(target=run_aimbot, daemon=True)
-        thread.start()
-        
-        # Start keyboard listener for F1/F2 hotkeys
-        def on_key_release(key):
+        # Start keyboard listener for F1/F2
+        def setup_hotkeys():
             try:
                 from pynput import keyboard as kb
                 from lib.aimbot import Aimbot
-                if key == kb.Key.f1:
-                    Aimbot.update_status_aimbot()
-                if key == kb.Key.f2:
-                    Aimbot.clean_up()
-            except:
-                pass
+                
+                def on_key_release(key):
+                    if key == kb.Key.f1:
+                        Aimbot.update_status_aimbot()
+                        if Aimbot.is_aimbot_enabled():
+                            self.after(0, lambda: self.status_label.configure(text="● AIM ON", text_color="#00ff88"))
+                        else:
+                            self.after(0, lambda: self.status_label.configure(text="● AIM OFF", text_color="#ff6b6b"))
+                    elif key == kb.Key.f2:
+                        os._exit(0)
+                        
+                listener = kb.Listener(on_release=on_key_release)
+                listener.start()
+            except Exception as e:
+                print(f"Hotkey Error: {e}")
         
-        from pynput import keyboard
-        listener = keyboard.Listener(on_release=on_key_release)
-        listener.start()
+        def run_aimbot():
+            try:
+                # Ensure existing instance is killed or handled? 
+                # For this simplified version we assume fresh start
+                from lib.aimbot import Aimbot
+                bot = Aimbot()
+                bot.start()
+            except Exception as e:
+                print(f"Aimbot Error: {e}")
         
-        self.start_btn.configure(text="⏹ Running...", fg_color="orange")
-        self.status_label.configure(text="Status: Aimbot Running (F1 to toggle)")
+        # Start threads
+        threading.Thread(target=setup_hotkeys, daemon=True).start()
+        threading.Thread(target=run_aimbot, daemon=True).start()
 
-
+# --- Main ---
 if __name__ == "__main__":
-    app = AIAimbotGUI()
+    app = GUI()
     app.mainloop()
