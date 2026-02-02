@@ -2,7 +2,7 @@ import ctypes
 import cv2
 import json
 import math
-import mss
+import dxcam
 import numpy as np
 import os
 import sys
@@ -194,7 +194,6 @@ class PIDController:
 class Aimbot:
     extra = ctypes.c_ulong(0)
     ii_ = Input_I()
-    screen = mss.mss()
     pixel_increment = 1 #controls how many pixels the mouse moves for each relative movement (lower = smoother/more human)
     with open("lib/config/config.json") as f:
         sens_config = json.load(f)
@@ -215,6 +214,16 @@ class Aimbot:
                 # print("[INFO] Config reloaded") 
         except:
             pass
+
+    @staticmethod
+    def send_input_move(x, y):
+        extra = ctypes.c_ulong(0)
+        ii_ = Input_I()
+        # 0x0001 = MOUSEEVENTF_MOVE
+        ii_.mi = MouseInput(int(x), int(y), 0, 0x0001, 0, ctypes.pointer(extra))
+        command = Input(ctypes.c_ulong(0), ii_)
+        ctypes.windll.user32.SendInput(1, ctypes.pointer(command), ctypes.sizeof(command))
+
     aimbot_status = colored("ENABLED", 'green')
     status_display_time = 0  # Time when status was last changed
     status_display_duration = 2  # Show status overlay for 2 seconds
@@ -271,6 +280,7 @@ class Aimbot:
 
         print("\n[INFO] PRESS 'F1' TO TOGGLE AIMBOT\n[INFO] PRESS 'F2' TO QUIT")
 
+    @staticmethod
     def update_status_aimbot():
         if Aimbot.aimbot_status == colored("ENABLED", 'green'):
             Aimbot.aimbot_status = colored("DISABLED", 'red')
@@ -284,11 +294,13 @@ class Aimbot:
         sys.stdout.write("\033[K")
         print(f"[!] AIMBOT IS [{Aimbot.aimbot_status}]", end = "\r")
 
+    @staticmethod
     def left_click():
         ctypes.windll.user32.mouse_event(0x0002) #left mouse down
         Aimbot.sleep(0.0001)
         ctypes.windll.user32.mouse_event(0x0004) #left mouse up
 
+    @staticmethod
     def sleep(duration, get_now = time.perf_counter):
         if duration == 0: return
         now = get_now()
@@ -341,6 +353,8 @@ class Aimbot:
                 # Fire!
                 if INTERCEPTION_AVAILABLE:
                     interception.left_click(clicks=1, interval=0.05)
+                else:
+                    Aimbot.left_click()
                 self.last_shot_time = current_time
 
     def rcs(self):
@@ -362,6 +376,8 @@ class Aimbot:
                 # We need to regulate this so it doesn't pull down instantly to the floor
                 # Execution happens every frame, so we keep values small
                 interception.move_relative(int(strength_x), int(strength_y))
+            else:
+                Aimbot.send_input_move(int(strength_x), int(strength_y))
 
     def move_crosshair(self, x, y):
         # Triggerbot check (Always active if enabled, even if not right-clicking? No, usually when aimed)
@@ -398,6 +414,8 @@ class Aimbot:
             
             if INTERCEPTION_AVAILABLE:
                 interception.move_relative(diff_x, diff_y)
+            else:
+                Aimbot.send_input_move(diff_x, diff_y)
             
             Aimbot.last_move_info = f"RAGE PULL: {diff_x}, {diff_y}"
             return
@@ -448,6 +466,8 @@ class Aimbot:
             # Execute movement
             if INTERCEPTION_AVAILABLE:
                 interception.move_relative(diff_x, diff_y)
+            else:
+                Aimbot.send_input_move(diff_x, diff_y)
         else:
             # FALLBACK: CLASSIC SIMPLE SMOOTHING (STABLE)
             # 1. Calculate offset
@@ -472,6 +492,8 @@ class Aimbot:
             if move_x != 0 or move_y != 0:
                 if INTERCEPTION_AVAILABLE:
                     interception.move_relative(move_x, move_y)
+                else:
+                    Aimbot.send_input_move(move_x, move_y)
 
 
     #generator yields pixel tuples for relative movement
@@ -495,10 +517,18 @@ class Aimbot:
         Aimbot.update_status_aimbot()
         half_screen_width = ctypes.windll.user32.GetSystemMetrics(0)/2 #this should always be 960
         half_screen_height = ctypes.windll.user32.GetSystemMetrics(1)/2 #this should always be 540
-        detection_box = {'left': int(half_screen_width - self.box_constant//2), #x1 coord (for top-left corner of the box)
-                          'top': int(half_screen_height - self.box_constant//2), #y1 coord (for top-left corner of the box)
-                          'width': int(self.box_constant),  #width of the box
-                          'height': int(self.box_constant)} #height of the box
+
+        left = int(half_screen_width - self.box_constant//2)
+        top = int(half_screen_height - self.box_constant//2)
+        right = int(left + self.box_constant)
+        bottom = int(top + self.box_constant)
+
+        detection_box = {'left': left, 'top': top, 'width': int(self.box_constant), 'height': int(self.box_constant)}
+        region = (left, top, right, bottom)
+
+        # Initialize DXCam
+        self.camera = dxcam.create(output_idx=0, output_color="BGR")
+
         if self.collect_data:
             collect_pause = 0
 
@@ -510,9 +540,9 @@ class Aimbot:
                 Aimbot.reload_config()
                 Aimbot.config_reload_time = time.perf_counter()
             
-            frame = np.array(Aimbot.screen.grab(detection_box))
-            # Convert BGRA to BGR and make contiguous for OpenCV
-            frame = np.ascontiguousarray(frame[:, :, :3])
+            frame = self.camera.grab(region=region)
+            if frame is None:
+                continue
             
             if self.collect_data: orig_frame = np.copy((frame))
             
@@ -703,7 +733,6 @@ class Aimbot:
 
     def clean_up():
         print("\n[INFO] F2 WAS PRESSED. QUITTING...")
-        Aimbot.screen.close()
         os._exit(0)
 
 if __name__ == "__main__": print("You are in the wrong directory and are running the wrong file; you must run lunar.py")
