@@ -21,3 +21,4 @@ pywin32
 requests
 wheel
 termcolor
+dxcam
