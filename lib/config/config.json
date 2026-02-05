@@ -1,0 +1,22 @@
+{
+    "fov_radius": 95,
+    "x_speed": 1.6402515723270443,
+    "y_speed": 1.466352201257862,
+    "aim_point_ratio": 0.1,
+    "scale": 31.323076923076925,
+    "enabled": true,
+    "smoothing": 0.11157407407407408,
+    "trigger_radius": 100,
+    "rcs_enabled": true,
+    "conf_thres": 0.5042402826855124,
+    "smoothness": 0.10277777777777777,
+    "roi_size": 320,
+    "rcs_strength_y": 8,
+    "rcs_strength_x": 0,
+    "rcs_base_strength": 8,
+    "rcs_max_strength": 25,
+    "rcs_ramp_rate": 1.5,
+    "rcs_activation_delay": 0.05,
+    "prediction_factor": 0.1,
+    "velocity_smoothing": 0.6
+}
