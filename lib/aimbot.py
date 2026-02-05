@@ -14,6 +14,11 @@ import winsound
 import random
 import gc
 import psutil
+from typing import Optional, Tuple, Any
+from termcolor import colored
+from lib.presets import get_preset_manager, get_active_preset, PresetConfig
+from lib.lock_logic import Candidate, LockState, select_locked_candidate, update_lock_state
+
 try:
     import pycuda.autoinit
     import pycuda.driver as cuda
@@ -30,14 +35,15 @@ try:
 except:
     pass
 
-from termcolor import colored
-
 # Try to import interception driver for anti-cheat bypass
 try:
     import interception
+    # Test if driver is actually installed by checking for the requires_driver decorator
+    # If driver is not installed, any function call will raise DriverNotFoundError
+    interception.auto_capture_devices(keyboard=False, mouse=True)
     INTERCEPTION_AVAILABLE = True
     print(colored("[+] Interception Driver LOADED - Anti-cheat bypass enabled", "green"))
-except ImportError:
+except Exception:
     INTERCEPTION_AVAILABLE = False
     print(colored("[!] Interception Driver not available - using SendInput", "yellow"))
 
@@ -74,6 +80,26 @@ class Input(ctypes.Structure):
 
 class POINT(ctypes.Structure):
     _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
+
+# ========== SENDINPUT MOUSE MOVEMENT HELPER ==========
+def move_mouse_relative(dx: int, dy: int):
+    """
+    Move mouse relative to current position using either Interception or SendInput.
+    This is the unified function for all mouse movements.
+    """
+    if dx == 0 and dy == 0:
+        return
+        
+    if INTERCEPTION_AVAILABLE:
+        interception.move_relative(dx, dy)
+    else:
+        # Fallback to mouse_event (more compatible with games than SendInput)
+        # MOUSEEVENTF_MOVE = 0x0001
+        ctypes.windll.user32.mouse_event(0x0001, dx, dy, 0, 0)
+        
+        # Debug print (remove after testing)
+        # print(f"[DEBUG] Moving mouse: dx={dx}, dy={dy}")
+# ======================================================
 
 class TRTModel:
     def __init__(self, engine_path):
@@ -198,9 +224,9 @@ class Aimbot:
     pixel_increment = 1 #controls how many pixels the mouse moves for each relative movement (lower = smoother/more human)
     with open("lib/config/config.json") as f:
         sens_config = json.load(f)
-    config_reload_time = 0
+    config_reload_time: float = 0.0
     
-    last_config_mtime = 0
+    last_config_mtime: float = 0.0
     
     @staticmethod
     def reload_config():
@@ -216,22 +242,44 @@ class Aimbot:
         except:
             pass
     aimbot_status = colored("ENABLED", 'green')
-    status_display_time = 0  # Time when status was last changed
+    status_display_time: float = 0.0  # Time when status was last changed
     status_display_duration = 2  # Show status overlay for 2 seconds
     last_move_info = ""  # Debug info for last move attempt
     
     # Target locking variables - prevent switching between multiple enemies
-    locked_target_x = None
-    locked_target_y = None
-    lock_time = 0
+    locked_target_x: Optional[int] = None
+    locked_target_y: Optional[int] = None
+    lock_time: float = 0.0
     lock_duration = 0.5  # Stay locked to same target for 500ms
+    lock_state = LockState()
+    
+    # Triggerbot timing
+    last_shot_time: float = 0.0
     
     # Aim prediction variables (unused but kept for compatibility)
+    # Aim prediction variables
     prev_target_x = 960
     prev_target_y = 540
     prev_time = time.time()
     velocity_x = 0
     velocity_y = 0
+    smooth_vx = 0
+    smooth_vy = 0
+    
+    # Micro-movement filtering
+    micro_movement_threshold = 2.0  # Minimum movement in pixels to respond to
+    micro_movement_counter = 0
+    last_significant_move = time.time()
+    
+    # Advanced interpolation for lost targets
+    interpolation_enabled = True
+    max_interpolation_time = 0.3  # Maximum time to interpolate (seconds)
+    
+    # Smart RCS tracking variables
+    spray_start_time: float = 0.0
+    is_spraying: bool = False
+    last_rcs_strength: float = 0.0
+    shots_fired: int = 0
     
     # PID Controller instance for smooth aim
     pid_controller = PIDController(
@@ -284,12 +332,14 @@ class Aimbot:
         sys.stdout.write("\033[K")
         print(f"[!] AIMBOT IS [{Aimbot.aimbot_status}]", end = "\r")
 
+    @staticmethod
     def left_click():
         ctypes.windll.user32.mouse_event(0x0002) #left mouse down
-        Aimbot.sleep(0.0001)
+        Aimbot._sleep(0.0001)
         ctypes.windll.user32.mouse_event(0x0004) #left mouse up
 
-    def sleep(duration, get_now = time.perf_counter):
+    @staticmethod
+    def _sleep(duration: float, get_now = time.perf_counter):
         if duration == 0: return
         now = get_now()
         end = now + duration
@@ -299,13 +349,19 @@ class Aimbot:
     def is_aimbot_enabled():
         return True if Aimbot.aimbot_status == colored("ENABLED", 'green') else False
 
+    @staticmethod
     def is_targeted():
-        return True if win32api.GetKeyState(0x02) in (-127, -128) else False
+        # Use GetAsyncKeyState instead of GetKeyState for better game compatibility
+        # 0x02 = VK_RBUTTON (Right Mouse Button)
+        # Check if the high-order bit is set (key is pressed)
+        state = ctypes.windll.user32.GetAsyncKeyState(0x02)
+        return (state & 0x8000) != 0
 
-    def is_target_locked(x, y):
+    @staticmethod
+    def is_target_locked(x: int, y: int) -> bool:
         #plus/minus 5 pixel threshold
         threshold = 5
-        return True if 960 - threshold <= x <= 960 + threshold and 540 - threshold <= y <= 540 + threshold else False
+        return 960 - threshold <= x <= 960 + threshold and 540 - threshold <= y <= 540 + threshold
 
     # Momentum history removed - back to simple immediate prediction
 
@@ -343,34 +399,65 @@ class Aimbot:
                     interception.left_click(clicks=1, interval=0.05)
                 self.last_shot_time = current_time
 
-    def rcs(self):
-        """
-        Recoil Control System: Pulls the mouse down when Left Click is held.
-        """
-        if not Aimbot.sens_config.get("rcs_enabled", False):
-            return
-
-        # Check if Left Mouse Button is held (VK_LBUTTON = 0x01)
-        if win32api.GetKeyState(0x01) < 0:
-            strength_y = Aimbot.sens_config.get("rcs_strength_y", 2)
-            strength_x = Aimbot.sens_config.get("rcs_strength_x", 0)
-            
-            # Simple constant pull down for now
-            # In a pro version, this would read weapon patterns, but generic pull is good for general use
-            if INTERCEPTION_AVAILABLE:
-                # Move pixel by pixel to be smooth
-                # We need to regulate this so it doesn't pull down instantly to the floor
-                # Execution happens every frame, so we keep values small
-                interception.move_relative(int(strength_x), int(strength_y))
-
     def move_crosshair(self, x, y):
-        # Triggerbot check (Always active if enabled, even if not right-clicking? No, usually when aimed)
+        # 1. Triggerbot check always runs
         self.triggerbot(x, y)
         
-        # RCS Logic (Runs independent of Right Click, usually on Left Click)
-        self.rcs()
+        # 2. SMART RCS Logic (Lock-Aware, Adaptive)
+        # Runs INDEPENDENTLY of Aimbot Lock to ensure recoil is always controlled
+        rcs_y_offset = 0
+        current_time = time.time()
+        is_left_click_held = win32api.GetKeyState(0x01) < 0
+        
+        if is_left_click_held and Aimbot.sens_config.get("rcs_enabled", False):
+            # Track spray state
+            if not Aimbot.is_spraying:
+                # First shot - start spray tracking
+                Aimbot.spray_start_time = current_time
+                Aimbot.is_spraying = True
+                Aimbot.shots_fired = 1
+            else:
+                Aimbot.shots_fired += 1
+            
+            # Get Smart RCS parameters
+            base_strength = Aimbot.sens_config.get("rcs_base_strength", 8)
+            max_strength = Aimbot.sens_config.get("rcs_max_strength", 25)
+            ramp_rate = Aimbot.sens_config.get("rcs_ramp_rate", 1.5)
+            activation_delay = Aimbot.sens_config.get("rcs_activation_delay", 0.05)
+            
+            spray_duration = current_time - Aimbot.spray_start_time
+            
+            # Check activation delay (allow single shots without RCS)
+            if spray_duration > activation_delay:
+                # Calculate ramp factor (increases with spray duration)
+                ramp_factor = 1.0 + (spray_duration * ramp_rate)
+                effective_rcs = base_strength * ramp_factor
+                
+                # Cap at max strength
+                effective_rcs = min(effective_rcs, max_strength)
+                
+                # Lock-Aware Scaling:
+                # If aimbot is locked on target, reduce RCS (aimbot handles vertical correction)
+                is_locked = Aimbot.is_targeted()
+                if is_locked:
+                    effective_rcs *= 0.6  # 40% reduction when locked
+                
+                rcs_y_offset = effective_rcs
+                Aimbot.last_rcs_strength = effective_rcs
+                
+                # [DEBUG] Print Smart RCS values
+                print(f"SPRAY:{spray_duration:.2f}s | SHOTS:{Aimbot.shots_fired} | RCS:{effective_rcs:.1f} | LOCKED:{is_locked}")
+            
+            # If NO target locked, Apply RCS directly here (Standalone Mode)
+            if not Aimbot.is_targeted() and rcs_y_offset > 0:
+                move_mouse_relative(0, int(rcs_y_offset))
+        else:
+            # Reset spray tracking when not shooting
+            if Aimbot.is_spraying:
+                Aimbot.is_spraying = False
+                Aimbot.shots_fired = 0
 
-        # ONLY activate aim movement when right-click is held (ADS mode)
+        # 3. AIMBOT Logic (Only runs if targeted)
         if not Aimbot.is_targeted():
             Aimbot.last_move_info = "Waiting for ADS..."
             # Reset history
@@ -385,6 +472,89 @@ class Aimbot:
         x_speed = Aimbot.sens_config.get("x_speed", 1.0)
         y_speed = Aimbot.sens_config.get("y_speed", 1.0)
         smoothness = Aimbot.sens_config.get("smoothness", 0.5)
+        
+        # === ADVANCED PREDICTIVE AIMING LOGIC ===
+        curr_time = time.time()
+        dt = curr_time - Aimbot.prev_time
+        
+        target_x = x
+        target_y = y
+        
+        if dt > 0:
+            # Calculate raw velocity (pixels per second)
+            vx = (x - Aimbot.prev_target_x) / dt
+            vy = (y - Aimbot.prev_target_y) / dt
+            
+            # Get velocity smoothing from config
+            smoothing_factor = Aimbot.sens_config.get("velocity_smoothing", 0.6)
+            
+            # Enhanced velocity smoothing with movement consistency detection
+            speed = math.hypot(vx, vy)
+            prev_speed = math.hypot(Aimbot.smooth_vx, Aimbot.smooth_vy)
+            
+            # Adaptive smoothing: higher for consistent movement, lower for erratic
+            if abs(speed - prev_speed) < 100:  # Consistent speed
+                adaptive_smoothing = min(smoothing_factor + 0.2, 0.9)
+            else:  # Erratic movement (strafing, zigzag)
+                adaptive_smoothing = max(smoothing_factor - 0.3, 0.3)
+            
+            # Smooth velocity (Adaptive Exponential Moving Average)
+            Aimbot.smooth_vx = adaptive_smoothing * Aimbot.smooth_vx + (1 - adaptive_smoothing) * vx
+            Aimbot.smooth_vy = adaptive_smoothing * Aimbot.smooth_vy + (1 - adaptive_smoothing) * vy
+            
+            # === ENHANCED ADAPTIVE PREDICTION ===
+            # Enhanced prediction with movement pattern awareness
+            speed = math.hypot(Aimbot.smooth_vx, Aimbot.smooth_vy)
+            
+            # Detect movement pattern for better prediction
+            if Aimbot.lock_state.movement_pattern == "strafing":
+                # Strafing targets need more aggressive prediction
+                base_prediction = Aimbot.sens_config.get("strafe_prediction_factor", 0.25)
+                pred_factor = base_prediction + (speed / 1000) * 0.1
+            elif Aimbot.lock_state.movement_pattern == "zigzag":
+                # Zigzag needs conservative prediction
+                base_prediction = Aimbot.sens_config.get("zigzag_prediction_factor", 0.08)
+                pred_factor = base_prediction
+            elif speed > 800:  # Very fast (sprint + strafe)
+                pred_factor = Aimbot.sens_config.get("prediction_max", 0.25)
+            elif speed > 400:  # Fast (running)
+                pred_min = Aimbot.sens_config.get("prediction_min", 0.05)
+                pred_max = Aimbot.sens_config.get("prediction_max", 0.25)
+                pred_factor = pred_min + (pred_max - pred_min) * ((speed - 400) / 400)
+            elif speed > 150:  # Medium (walking)
+                pred_min = Aimbot.sens_config.get("prediction_min", 0.05)
+                pred_factor = pred_min + (Aimbot.sens_config.get("prediction_max", 0.25) - pred_min) * 0.4 * ((speed - 150) / 250)
+            else:  # Slow/stationary
+                pred_factor = Aimbot.sens_config.get("prediction_min", 0.05) * 0.3
+            
+            # Apply enhanced prediction with acceleration compensation
+            accel_compensation = 0.5  # Compensate for acceleration
+            target_x = x + (Aimbot.smooth_vx * pred_factor) + (Aimbot.lock_state.accel_x * pred_factor * accel_compensation)
+            target_y = y + (Aimbot.smooth_vy * pred_factor) + (Aimbot.lock_state.accel_y * pred_factor * accel_compensation)
+            
+            # Micro-movement filtering
+            movement_distance = math.hypot(target_x - x, target_y - y)
+            if movement_distance < Aimbot.micro_movement_threshold:
+                Aimbot.micro_movement_counter += 1
+                if Aimbot.micro_movement_counter < 5:  # Allow a few micro-movements
+                    target_x = x
+                    target_y = y
+                else:
+                    # After threshold, allow micro-movements but with reduced sensitivity
+                    reduction_factor = 0.7
+                    target_x = x + (target_x - x) * reduction_factor
+                    target_y = y + (target_y - y) * reduction_factor
+            else:
+                Aimbot.micro_movement_counter = 0
+                Aimbot.last_significant_move = curr_time
+        
+        Aimbot.prev_time = curr_time
+        Aimbot.prev_target_x = x
+        Aimbot.prev_target_y = y
+        
+        # Use predicted coordinates for aiming
+        x = target_x
+        y = target_y
 
         # === RAGE / BRUTAL MODE Logic (If smoothness < 0.2) ===
         if smoothness < 0.2:
@@ -396,48 +566,101 @@ class Aimbot:
             diff_x = int(raw_offset_x * scale / 10 * sensitivity * x_speed)
             diff_y = int(raw_offset_y * scale / 10 * sensitivity * y_speed)
             
-            if INTERCEPTION_AVAILABLE:
-                interception.move_relative(diff_x, diff_y)
+            move_mouse_relative(diff_x, diff_y)
             
             Aimbot.last_move_info = f"RAGE PULL: {diff_x}, {diff_y}"
             return
         # ===============================================
 
-        # === LEGIT MODE WITH PID CONTROLLER ===
-        # Professional-grade aim smoothing using P.I.D. algorithm
+        # === ENHANCED LEGIT MODE WITH ADAPTIVE PID CONTROLLER ===
+        # Professional-grade aim smoothing using adaptive P.I.D. algorithm
         
         pid_enabled = Aimbot.sens_config.get("pid_enabled", True)
         
         if pid_enabled:
-            # Update PID parameters from config (hot-reload)
-            Aimbot.pid_controller.kp = Aimbot.sens_config.get("pid_kp", 0.7)
-            Aimbot.pid_controller.ki = Aimbot.sens_config.get("pid_ki", 0.05)
-            Aimbot.pid_controller.kd = Aimbot.sens_config.get("pid_kd", 0.15)
-            
             # Calculate error (distance from crosshair to target)
             error_x = x - 960  # Target X - Screen Center X
             error_y = y - 540  # Target Y - Screen Center Y
             
-            # DEADZONE: If very close, STOP completely (Prevents shake)
-            if abs(error_x) < 4 and abs(error_y) < 4:
-                Aimbot.pid_controller.reset() # Reset I-term so it doesn't wind up
+            # Adaptive PID tuning based on movement pattern and speed
+            target_speed = math.hypot(Aimbot.smooth_vx, Aimbot.smooth_vy)
+            
+            if Aimbot.lock_state.movement_pattern == "strafing":
+                # Strafing targets need aggressive response
+                kp = Aimbot.sens_config.get("pid_kp_strafe", 1.2)
+                ki = Aimbot.sens_config.get("pid_ki_strafe", 0.12)
+                kd = Aimbot.sens_config.get("pid_kd_strafe", 0.25)
+            elif Aimbot.lock_state.movement_pattern == "zigzag":
+                # Zigzag needs balanced response
+                kp = Aimbot.sens_config.get("pid_kp_zigzag", 0.8)
+                ki = Aimbot.sens_config.get("pid_ki_zigzag", 0.06)
+                kd = Aimbot.sens_config.get("pid_kd_zigzag", 0.15)
+            elif target_speed > 600:  # Very fast targets
+                kp = Aimbot.sens_config.get("pid_kp_fast", 1.0)
+                ki = Aimbot.sens_config.get("pid_ki_fast", 0.10)
+                kd = Aimbot.sens_config.get("pid_kd_fast", 0.20)
+            else:  # Normal targets
+                kp = Aimbot.sens_config.get("pid_kp", 0.95)
+                ki = Aimbot.sens_config.get("pid_ki", 0.08)
+                kd = Aimbot.sens_config.get("pid_kd", 0.20)
+            
+            # Update PID parameters
+            Aimbot.pid_controller.kp = kp
+            Aimbot.pid_controller.ki = ki
+            Aimbot.pid_controller.kd = kd
+            
+            # Dynamic deadzone based on target speed
+            if target_speed > 400:
+                deadzone = 1.5  # Tighter deadzone for fast targets
+            elif target_speed > 200:
+                deadzone = 2.0  # Medium deadzone
+            else:
+                deadzone = 2.5  # Larger deadzone for slow targets
+            
+            # Enhanced deadzone with micro-movement tolerance
+            if abs(error_x) < deadzone and abs(error_y) < deadzone:
+                # Only reset if we're consistently in deadzone
+                if time.time() - Aimbot.last_significant_move > 0.1:
+                    Aimbot.pid_controller.reset() # Reset I-term so it doesn't wind up
                 return
             
             # Get PID output (how much to move)
             pid_out_x, pid_out_y = Aimbot.pid_controller.update(error_x, error_y)
             
-            # Apply speed scaling
-            diff_x = pid_out_x * scale / 100 * x_speed
-            diff_y = pid_out_y * scale / 100 * y_speed
+            # Enhanced movement scaling based on error magnitude
+            error_magnitude = math.hypot(error_x, error_y)
+            if error_magnitude > 100:  # Large error - fast movement
+                speed_multiplier = 1.2
+            elif error_magnitude > 50:  # Medium error
+                speed_multiplier = 1.0
+            else:  # Small error - fine adjustment
+                speed_multiplier = 0.8
             
-            # CAP maximum movement
-            max_move = 60
+            # Apply speed scaling with enhanced multiplier
+            diff_x = pid_out_x * scale / 100 * x_speed * speed_multiplier
+            diff_y = (pid_out_y * scale / 100 * y_speed * speed_multiplier) + rcs_y_offset
+            
+            # Dynamic maximum movement based on target speed
+            if target_speed > 500:
+                max_move = 80  # Higher cap for very fast targets
+            elif target_speed > 300:
+                max_move = 70
+            else:
+                max_move = 60
+            
             diff_x = max(-max_move, min(max_move, diff_x))
             diff_y = max(-max_move, min(max_move, diff_y))
             
-            # FILTER: Ignore very small movements (Anti-Jitter)
-            if abs(diff_x) < 1.0 and abs(diff_y) < 1.0:
+            # Enhanced anti-jitter filtering with micro-movement tolerance
+            if abs(diff_x) < 0.5 and abs(diff_y) < 0.5:
                 return
+            elif abs(diff_x) < 1.0 and abs(diff_y) < 1.0 and target_speed < 100:
+                # Allow tiny movements only if target is moving slowly
+                if Aimbot.micro_movement_counter > 3:
+                    return
+                Aimbot.micro_movement_counter += 1
+            else:
+                Aimbot.micro_movement_counter = 0
 
             diff_x = int(diff_x)
             diff_y = int(diff_y)
@@ -446,8 +669,7 @@ class Aimbot:
                 return
             
             # Execute movement
-            if INTERCEPTION_AVAILABLE:
-                interception.move_relative(diff_x, diff_y)
+            move_mouse_relative(diff_x, diff_y)
         else:
             # FALLBACK: CLASSIC SIMPLE SMOOTHING (STABLE)
             # 1. Calculate offset
@@ -470,8 +692,7 @@ class Aimbot:
             move_y = int(diff_y)
             
             if move_x != 0 or move_y != 0:
-                if INTERCEPTION_AVAILABLE:
-                    interception.move_relative(move_x, move_y)
+                move_mouse_relative(move_x, move_y)
 
 
     #generator yields pixel tuples for relative movement
@@ -553,7 +774,10 @@ class Aimbot:
 
             # --- PROCESSING STEP ---
             if len(results_xyxy) != 0: #player detected
-                least_crosshair_dist = closest_detection = player_in_frame = False
+                least_crosshair_dist: float = float('inf')  # Use infinity as initial value
+                closest_detection = None
+                player_in_frame = False
+                candidates = []
                 for x1, y1, x2, y2, conf in results_xyxy: #iterate over each player detected
                     w = x2 - x1
                     h = y2 - y1
@@ -569,9 +793,16 @@ class Aimbot:
                     if y2 > self.box_constant - 5:
                         continue
                     
-                    # Calculate head position - use configurable aim_point_ratio from config
-                    aim_ratio = Aimbot.sens_config.get("aim_point_ratio", 0.10)
-                    relative_head_X, relative_head_Y = int((x1 + x2)/2), int(y1 + h * aim_ratio)
+                    # Calculate head position - use preset system
+                    active_preset = get_active_preset()
+                    aim_ratio = active_preset.aim_point_ratio
+                    h_offset = active_preset.horizontal_offset
+                    
+                    # Apply horizontal offset
+                    center_x = (x1 + x2) / 2
+                    offset_x = w * h_offset
+                    relative_head_X = int(center_x + offset_x)
+                    relative_head_Y = int(y1 + h * aim_ratio)
                     own_player = x1 < 15 or (x1 < self.box_constant/5 and y2 > self.box_constant/1.2) 
                     
                     x1y1 = (x1, y1)
@@ -580,87 +811,133 @@ class Aimbot:
                     #calculate the distance between each detection and the crosshair
                     crosshair_dist = math.dist((relative_head_X, relative_head_Y), (self.box_constant/2, self.box_constant/2))
                     
-                    if not least_crosshair_dist: least_crosshair_dist = crosshair_dist
+                    if crosshair_dist < least_crosshair_dist: 
+                        least_crosshair_dist = crosshair_dist
 
                     # FOV Filter
-                    fov_radius = Aimbot.sens_config.get("fov_radius", 150)
-                    if crosshair_dist > fov_radius:
+                    fov_radius_val = float(Aimbot.sens_config.get("fov_radius", 150))
+                    if crosshair_dist > fov_radius_val:
                         continue 
 
-                    if crosshair_dist <= least_crosshair_dist and not own_player:
-                        least_crosshair_dist = crosshair_dist
-                        closest_detection = {"x1y1": x1y1, "x2y2": x2y2, "relative_head_X": relative_head_X, "relative_head_Y": relative_head_Y, "conf": conf, "crosshair_dist": crosshair_dist}
-
                     if not own_player:
+                        if crosshair_dist <= least_crosshair_dist:
+                            least_crosshair_dist = crosshair_dist
+                            closest_detection = {"x1y1": x1y1, "x2y2": x2y2, "relative_head_X": relative_head_X, "relative_head_Y": relative_head_Y, "conf": conf, "crosshair_dist": crosshair_dist}
+                        
+                        abs_head_x = relative_head_X + detection_box['left']
+                        abs_head_y = relative_head_Y + detection_box['top']
+                        candidates.append(Candidate(
+                            abs_x=abs_head_x,
+                            abs_y=abs_head_y,
+                            rel_x=relative_head_X,
+                            rel_y=relative_head_Y,
+                            x1=int(x1),
+                            y1=int(y1),
+                            x2=int(x2),
+                            y2=int(y2),
+                            conf=float(conf),
+                            crosshair_dist=crosshair_dist,
+                            area=float(w * h),
+                        ))
                         # Draw box - Color based on confidence (Visual Debug)
-                        color = (0, 255, 0) if conf > 0.6 else (0, 165, 255) # Green = High Conf, Orange = Low
+                        conf_val = float(conf) if not isinstance(conf, (list, tuple)) else 0.5
+                        color = (0, 255, 0) if conf_val > 0.6 else (0, 165, 255) # Green = High Conf, Orange = Low
                         cv2.rectangle(frame, x1y1, x2y2, color, 2) 
-                        cv2.putText(frame, f"{int(conf * 100)}%", x1y1, cv2.FONT_HERSHEY_DUPLEX, 0.5, color, 2) 
+                        cv2.putText(frame, f"{int(conf_val * 100)}%", x1y1, cv2.FONT_HERSHEY_DUPLEX, 0.5, color, 2) 
                     else:
                         own_player = False
                         if not player_in_frame:
                             player_in_frame = True
 
-                if closest_detection: #if valid detection exists
+                if candidates:
                     current_time = time.time()
-                    
-                    # Target locking logic - prevent switching between enemies
-                    locked_detection = None
-                    
-                    # If we have an active lock
-                    if Aimbot.locked_target_x is not None and (current_time - Aimbot.lock_time) < Aimbot.lock_duration:
-                        # Find detection closest to the LOCKED position (not crosshair)
-                        best_dist_to_lock = 100 # Threshold distance in pixels
-                        
-                        for x1, y1, x2, y2, conf in results_xyxy:
-                            bx1, by1 = x1, y1
-                            bx2, by2 = x2, y2
-                            bh = by2 - by1
-                            # Correct head calculation for distance check
-                            check_head_x, check_head_y = int((bx1 + bx2)/2), int(by1 + bh/10)
-                            
-                            # Absolute position on screen
-                            abs_check_x = check_head_x + detection_box['left']
-                            abs_check_y = check_head_y + detection_box['top']
-                            
-                            dist_to_lock = math.dist((abs_check_x, abs_check_y), (Aimbot.locked_target_x, Aimbot.locked_target_y))
-                            
-                            if dist_to_lock < best_dist_to_lock:
-                                best_dist_to_lock = dist_to_lock
-                                locked_detection = {
-                                    "x1y1": [bx1, by1], 
-                                    "x2y2": [bx2, by2], 
-                                    "relative_head_X": check_head_x, 
-                                    "relative_head_Y": check_head_y, 
-                                    "conf": conf
-                                }
-                    
-                    if locked_detection:
-                        # Continue tracking the locked target
-                        closest_detection = locked_detection
-                        Aimbot.locked_target_x = closest_detection["relative_head_X"] + detection_box['left']
-                        Aimbot.locked_target_y = closest_detection["relative_head_Y"] + detection_box['top']
+
+                    lock_grace_time = float(Aimbot.sens_config.get("lock_grace_time", Aimbot.lock_duration))
+                    base_radius = float(Aimbot.sens_config.get("lock_base_radius", 100))
+                    reacquire_radius = float(Aimbot.sens_config.get("lock_reacquire_radius", 180))
+                    min_conf = float(Aimbot.sens_config.get("lock_min_conf", Aimbot.sens_config.get("conf_thres", 0.45)))
+                    min_area_ratio = float(Aimbot.sens_config.get("lock_min_area_ratio", 0.4))
+                    ping_ms = float(Aimbot.sens_config.get("ping_comp_ms", 60))
+                    ping_scale = float(Aimbot.sens_config.get("ping_comp_scale", 0.6))
+                    sticky_multiplier = float(Aimbot.sens_config.get("lock_sticky_multiplier", 1.5))
+                    teleport_threshold = float(Aimbot.sens_config.get("target_teleport_threshold", 300))
+                    use_prediction = bool(Aimbot.sens_config.get("use_prediction", True))
+
+                    locked_candidate, _ = select_locked_candidate(
+                        tuple(candidates),
+                        Aimbot.lock_state,
+                        current_time,
+                        base_radius,
+                        reacquire_radius,
+                        lock_grace_time,
+                        min_conf,
+                        min_area_ratio,
+                        ping_ms,
+                        ping_scale,
+                        sticky_multiplier,
+                        teleport_threshold,
+                        use_prediction,
+                    )
+
+                    selected = None
+                    if locked_candidate is not None:
+                        selected = locked_candidate
                         Aimbot.lock_time = current_time
+                        Aimbot.locked_target_x = selected.abs_x
+                        Aimbot.locked_target_y = selected.abs_y
+                        update_lock_state(Aimbot.lock_state, selected, current_time)
                     else:
-                        # No lock or lost lock -> Acquire new target closest to crosshair
-                        Aimbot.locked_target_x = closest_detection["relative_head_X"] + detection_box['left']
-                        Aimbot.locked_target_y = closest_detection["relative_head_Y"] + detection_box['top']
-                        Aimbot.lock_time = current_time
-                    cv2.circle(frame, (closest_detection["relative_head_X"], closest_detection["relative_head_Y"]), 5, (115, 244, 113), -1) #draw circle on the head
+                        if Aimbot.lock_state.x is not None and (current_time - Aimbot.lock_state.last_seen_time) <= lock_grace_time:
+                            update_lock_state(Aimbot.lock_state, None, current_time)
+                        else:
+                            selected = min(candidates, key=lambda c: c.crosshair_dist)
+                            Aimbot.lock_time = current_time
+                            Aimbot.locked_target_x = selected.abs_x
+                            Aimbot.locked_target_y = selected.abs_y
+                            update_lock_state(Aimbot.lock_state, selected, current_time)
 
-                    #draw line from the crosshair to the head
-                    cv2.line(frame, (closest_detection["relative_head_X"], closest_detection["relative_head_Y"]), (self.box_constant//2, self.box_constant//2), (244, 242, 113), 2)
+                        if selected is None and (Aimbot.lock_state.x is None or (current_time - Aimbot.lock_state.last_seen_time) > lock_grace_time):
+                            Aimbot.lock_state = LockState()
+                            Aimbot.locked_target_x = None
+                            Aimbot.locked_target_y = None
 
-                    absolute_head_X, absolute_head_Y = closest_detection["relative_head_X"] + detection_box['left'], closest_detection["relative_head_Y"] + detection_box['top']
+                    if selected is not None:
+                        head_x = int(selected.rel_x)
+                        head_y = int(selected.rel_y)
+                        cv2.circle(frame, (head_x, head_y), 5, (115, 244, 113), -1) #draw circle on the head
 
-                    x1, y1 = closest_detection["x1y1"]
-                    if Aimbot.is_target_locked(absolute_head_X, absolute_head_Y):
-                        cv2.putText(frame, "LOCKED", (x1 + 40, y1), cv2.FONT_HERSHEY_DUPLEX, 0.5, (115, 244, 113), 2) #draw the confidence labels on the bounding boxes
-                    else:
-                        cv2.putText(frame, "TARGETING", (x1 + 40, y1), cv2.FONT_HERSHEY_DUPLEX, 0.5, (115, 113, 244), 2) #draw the confidence labels on the bounding boxes
+                        cv2.line(frame, (head_x, head_y), (self.box_constant//2, self.box_constant//2), (244, 242, 113), 2)
 
-                    if Aimbot.is_aimbot_enabled():
-                        Aimbot.move_crosshair(self, absolute_head_X, absolute_head_Y)
+                        absolute_head_X = selected.abs_x
+                        absolute_head_Y = selected.abs_y
+
+                        x1 = int(selected.x1)
+                        y1 = int(selected.y1)
+                        if Aimbot.is_target_locked(absolute_head_X, absolute_head_Y):
+                            cv2.putText(frame, "LOCKED", (x1 + 40, y1), cv2.FONT_HERSHEY_DUPLEX, 0.5, (115, 244, 113), 2) #draw the confidence labels on the bounding boxes
+                        else:
+                            cv2.putText(frame, "TARGETING", (x1 + 40, y1), cv2.FONT_HERSHEY_DUPLEX, 0.5, (115, 113, 244), 2) #draw the confidence labels on the bounding boxes
+
+                        if Aimbot.is_aimbot_enabled():
+                            Aimbot.move_crosshair(self, absolute_head_X, absolute_head_Y)
+                else:
+                    current_time = time.time()
+                    lock_grace_time = float(Aimbot.sens_config.get("lock_grace_time", Aimbot.lock_duration))
+                    if Aimbot.lock_state.x is not None:
+                        update_lock_state(Aimbot.lock_state, None, current_time)
+                        if (current_time - Aimbot.lock_state.last_seen_time) > lock_grace_time:
+                            Aimbot.lock_state = LockState()
+                            Aimbot.locked_target_x = None
+                            Aimbot.locked_target_y = None
+            else:
+                current_time = time.time()
+                lock_grace_time = float(Aimbot.sens_config.get("lock_grace_time", Aimbot.lock_duration))
+                if Aimbot.lock_state.x is not None:
+                    update_lock_state(Aimbot.lock_state, None, current_time)
+                    if (current_time - Aimbot.lock_state.last_seen_time) > lock_grace_time:
+                        Aimbot.lock_state = LockState()
+                        Aimbot.locked_target_x = None
+                        Aimbot.locked_target_y = None
 
             if self.collect_data and time.perf_counter() - collect_pause > 1 and Aimbot.is_targeted() and Aimbot.is_aimbot_enabled() and not player_in_frame: #screenshots can only be taken every 1 second
                 cv2.imwrite(f"lib/data/{str(uuid.uuid4())}.jpg", orig_frame)
@@ -692,7 +969,10 @@ class Aimbot:
                 center = (self.box_constant // 2, self.box_constant // 2)
                 cv2.circle(frame, center, fov_radius, (0, 255, 255), 2)  # Yellow circle
                 
-                cv2.imshow("AI AIMBOT", frame)
+                # Resize preview window to be larger for better visibility
+                # detection still happens on small ROI, this is just for display
+                display_frame = cv2.resize(frame, (320, 320), interpolation=cv2.INTER_NEAREST)
+                cv2.imshow("AI AIMBOT", display_frame)
                 if cv2.waitKey(1) & 0xFF == ord('0'):
                     break
             else:

@@ -18,6 +18,8 @@ mss
 pygame
 pynput
 pywin32
+psutil
+customtkinter
 requests
 wheel
 termcolor

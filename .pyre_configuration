@@ -1,0 +1,7 @@
+{
+  "source_directories": ["."],
+  "strict": false,
+  "ignore_all_errors": [
+    "lib/"
+  ]
+}

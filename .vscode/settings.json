@@ -1,0 +1,19 @@
+{
+    "python.defaultInterpreterPath": "C:\\Users\\riski\\AppData\\Local\\Programs\\Python\\Python310\\python.exe",
+    "python.analysis.extraPaths": [
+        "C:\\Users\\riski\\AppData\\Local\\Programs\\Python\\Python310\\Lib\\site-packages"
+    ],
+    "python.analysis.typeCheckingMode": "off",
+    "python.analysis.diagnosticMode": "openFilesOnly",
+    "python.analysis.diagnosticSeverityOverrides": {
+        "reportMissingImports": "none",
+        "reportMissingModuleSource": "none",
+        "reportGeneralTypeIssues": "none",
+        "reportOptionalMemberAccess": "none",
+        "reportArgumentType": "none",
+        "reportAttributeAccessIssue": "none"
+    },
+    "python.languageServer": "Pylance",
+    "pyre.enable": false,
+    "pyre.enableTypeChecking": false
+}
